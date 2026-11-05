@@ -1,0 +1,16 @@
+{
+  "name": "secret-chat",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "postinstall": "node scripts/make-icons.js"
+  },
+  "dependencies": {
+    "expo": "~55.0.0",
+    "react": "19.2.0",
+    "react-native": "0.83.0"
+  },
+  "private": true
+}

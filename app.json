@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Secret Chat",
+    "slug": "secret-chat",
+    "owner": "kingparjapatis-team",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0B1738",
+    "android": {
+      "package": "com.secretchat.app",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B1738"
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "d6aabd98-52b6-4251-9982-ed4feac7565a"
+      }
+    }
+  }
+}
