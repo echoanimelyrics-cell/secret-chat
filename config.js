@@ -1,3 +1,2 @@
-// Firebase Realtime Database ka URL yahan daalo (last mein slash nahi).
-// Example: https://secret-chat-xxxxx-default-rtdb.asia-southeast1.firebasedatabase.app
-export const DB_URL = 'PASTE_FIREBASE_URL_HERE';
+// Firebase Realtime Database ka URL (last mein slash nahi).
+export const DB_URL = 'https://secret-chat-6fd82-default-rtdb.asia-southeast1.firebasedatabase.app';
