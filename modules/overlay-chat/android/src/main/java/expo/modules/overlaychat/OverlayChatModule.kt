@@ -47,5 +47,9 @@ class OverlayChatModule : Module() {
     Function("isRunning") {
       OverlayService.running
     }
+
+    Function("lastError") {
+      OverlayService.lastError
+    }
   }
 }

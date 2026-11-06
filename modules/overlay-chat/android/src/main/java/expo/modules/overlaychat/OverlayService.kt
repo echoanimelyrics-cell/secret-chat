@@ -8,31 +8,81 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.Settings
-import android.text.InputFilter
-import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.TextView
 import org.json.JSONObject
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.Executors
 import kotlin.math.abs
+
+private class Seg(
+  val x0: Float,
+  val y0: Float,
+  val x1: Float,
+  val y1: Float,
+  val color: Int,
+  val t: Long
+)
+
+// Full-screen transparent view that shows finger strokes and fades them out.
+private class DrawView(c: Context, private val showMs: Long) : View(c) {
+  private val segs = ArrayList<Seg>()
+  private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+  init {
+    paint.style = Paint.Style.STROKE
+    paint.strokeCap = Paint.Cap.ROUND
+    paint.strokeWidth = 5f * c.resources.displayMetrics.density
+  }
+
+  fun addSeg(x0: Float, y0: Float, x1: Float, y1: Float, color: Int) {
+    segs.add(Seg(x0, y0, x1, y1, color, SystemClock.uptimeMillis()))
+    postInvalidateOnAnimation()
+  }
+
+  override fun onDraw(canvas: Canvas) {
+    super.onDraw(canvas)
+    val now = SystemClock.uptimeMillis()
+    val w = width.toFloat()
+    val h = height.toFloat()
+    val fade = 2000L
+    val iter = segs.iterator()
+    var any = false
+    while (iter.hasNext()) {
+      val s = iter.next()
+      val age = now - s.t
+      if (age > showMs) {
+        iter.remove()
+        continue
+      }
+      val a = if (age > showMs - fade) (showMs - age).toFloat() / fade else 1f
+      paint.color = s.color
+      paint.alpha = (255 * a).toInt().coerceIn(0, 255)
+      canvas.drawLine(s.x0 * w, s.y0 * h, s.x1 * w, s.y1 * h, paint)
+      any = true
+    }
+    if (any) postInvalidateOnAnimation()
+  }
+}
 
 class OverlayService : Service() {
 
@@ -44,14 +94,22 @@ class OverlayService : Service() {
     private const val CHANNEL_ID = "secret_chat_sharing"
     private const val NOTIF_ID = 4107
     private const val SHOW_MS = 10000L
-    private const val CLEANUP_MS = 60000L
+    private const val CLEANUP_MS = 30000L
+    private const val FLUSH_MS = 150L
+    private const val POLL_MS = 400L
     private const val MATCH = WindowManager.LayoutParams.MATCH_PARENT
+    private val MINE = Color.parseColor("#4F8CFF")
+    private val OTHER = Color.parseColor("#FF6FAE")
 
     @Volatile
     var running = false
+
+    @Volatile
+    var lastError = ""
   }
 
   private val main = Handler(Looper.getMainLooper())
+  private val io = Executors.newSingleThreadExecutor()
   private lateinit var wm: WindowManager
 
   private var dbUrl = ""
@@ -63,12 +121,16 @@ class OverlayService : Service() {
   private var alive = false
   private var poller: Thread? = null
 
-  private var displayLayer: FrameLayout? = null
+  private var drawView: DrawView? = null
   private var button: TextView? = null
   private var inputLayer: FrameLayout? = null
-  private var editor: EditText? = null
-  private var editorFx = 0f
-  private var editorFy = 0f
+
+  private val pending = ArrayList<Float>()
+  private var carryX = -1f
+  private var carryY = -1f
+  private var lastFx = 0f
+  private var lastFy = 0f
+  private var penDown = false
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -96,10 +158,12 @@ class OverlayService : Service() {
 
     dbUrl = db
     room = r
+    lastError = ""
     try {
       addDisplayLayer()
       addButton()
     } catch (e: Exception) {
+      lastError = "overlay: " + (e.message ?: e.javaClass.simpleName)
       stopSelf()
       return START_NOT_STICKY
     }
@@ -110,6 +174,8 @@ class OverlayService : Service() {
   }
 
   private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+  private fun fmt(v: Float): String = String.format(Locale.US, "%.3f", v)
 
   @Suppress("DEPRECATION")
   private fun overlayType(): Int {
@@ -162,10 +228,10 @@ class OverlayService : Service() {
 
   private fun fullScreenParams(touchable: Boolean): WindowManager.LayoutParams {
     var flags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+      WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
     if (!touchable) {
-      flags = flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+      flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
     }
     val lp = WindowManager.LayoutParams(MATCH, MATCH, overlayType(), flags, PixelFormat.TRANSLUCENT)
     lp.gravity = Gravity.TOP or Gravity.START
@@ -173,27 +239,23 @@ class OverlayService : Service() {
       lp.layoutInDisplayCutoutMode =
         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
     }
-    if (touchable) {
-      lp.softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN or
-        WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE
-    }
     return lp
   }
 
   private fun addDisplayLayer() {
-    val layer = FrameLayout(this)
+    val v = DrawView(this, SHOW_MS)
     val lp = fullScreenParams(false)
     // Android 12+ blocks touches through overlays that are more than 80 percent opaque.
     lp.alpha = 0.8f
-    wm.addView(layer, lp)
-    displayLayer = layer
+    wm.addView(v, lp)
+    drawView = v
   }
 
   private fun addButton() {
     val size = dp(56)
     val btn = TextView(this)
-    btn.text = "Aa"
-    btn.textSize = 18f
+    btn.text = "Draw"
+    btn.textSize = 13f
     btn.gravity = Gravity.CENTER
     btn.setTextColor(Color.WHITE)
     val bg = GradientDrawable()
@@ -240,7 +302,7 @@ class OverlayService : Service() {
           true
         }
         MotionEvent.ACTION_UP -> {
-          if (!moved) toggleInput()
+          if (!moved) openInput()
           true
         }
         else -> false
@@ -250,17 +312,20 @@ class OverlayService : Service() {
     button = btn
   }
 
-  private fun toggleInput() {
-    if (inputLayer == null) openInput() else closeInput()
-  }
-
   private fun openInput() {
     if (inputLayer != null) return
     val layer = FrameLayout(this)
-    layer.setBackgroundColor(0x66000000)
+    layer.setBackgroundColor(0x22000000)
+
+    val touch = View(this)
+    layer.addView(touch, FrameLayout.LayoutParams(MATCH, MATCH))
+    touch.setOnTouchListener { v, ev ->
+      handleTouch(v, ev)
+      true
+    }
 
     val hint = TextView(this)
-    hint.text = "Jahan likhna hai wahan tap karo"
+    hint.text = "Ungli se screen par likho ya banao"
     hint.setTextColor(Color.WHITE)
     hint.textSize = 16f
     val hlp = FrameLayout.LayoutParams(
@@ -271,137 +336,95 @@ class OverlayService : Service() {
     hlp.topMargin = dp(56)
     layer.addView(hint, hlp)
 
-    val cancel = TextView(this)
-    cancel.text = "Cancel"
-    cancel.setTextColor(Color.WHITE)
-    cancel.textSize = 16f
-    cancel.setPadding(dp(16), dp(10), dp(16), dp(10))
-    val cbg = GradientDrawable()
-    cbg.cornerRadius = dp(18).toFloat()
-    cbg.setColor(0xCCFF4D6D.toInt())
-    cancel.background = cbg
-    cancel.setOnClickListener { closeInput() }
-    val clp = FrameLayout.LayoutParams(
+    val done = TextView(this)
+    done.text = "Done"
+    done.setTextColor(Color.WHITE)
+    done.textSize = 16f
+    done.setPadding(dp(18), dp(10), dp(18), dp(10))
+    val dbg = GradientDrawable()
+    dbg.cornerRadius = dp(18).toFloat()
+    dbg.setColor(0xCCFF4D6D.toInt())
+    done.background = dbg
+    done.setOnClickListener { closeInput() }
+    val dlp = FrameLayout.LayoutParams(
       FrameLayout.LayoutParams.WRAP_CONTENT,
       FrameLayout.LayoutParams.WRAP_CONTENT
     )
-    clp.gravity = Gravity.TOP or Gravity.END
-    clp.topMargin = dp(40)
-    clp.rightMargin = dp(16)
-    layer.addView(cancel, clp)
-
-    layer.setOnTouchListener { _, ev ->
-      if (ev.action == MotionEvent.ACTION_UP) {
-        placeEditor(layer, ev.x, ev.y)
-      }
-      true
-    }
+    dlp.gravity = Gravity.TOP or Gravity.END
+    dlp.topMargin = dp(40)
+    dlp.rightMargin = dp(16)
+    layer.addView(done, dlp)
 
     wm.addView(layer, fullScreenParams(true))
     inputLayer = layer
   }
 
-  private fun placeEditor(layer: FrameLayout, tapX: Float, tapY: Float) {
-    val w = dp(240)
-    val h = dp(52)
-    val x = tapX.toInt().coerceIn(0, (layer.width - w).coerceAtLeast(0))
-    val y = tapY.toInt().coerceIn(0, (layer.height - h).coerceAtLeast(0))
-    editorFx = x.toFloat() / layer.width.coerceAtLeast(1)
-    editorFy = y.toFloat() / layer.height.coerceAtLeast(1)
-
-    val lp = FrameLayout.LayoutParams(w, FrameLayout.LayoutParams.WRAP_CONTENT)
-    lp.leftMargin = x
-    lp.topMargin = y
-
-    val existing = editor
-    if (existing != null) {
-      existing.layoutParams = lp
-      existing.requestFocus()
-      return
-    }
-
-    val et = EditText(this)
-    et.hint = "Likho..."
-    et.setTextColor(Color.WHITE)
-    et.setHintTextColor(0x99FFFFFF.toInt())
-    et.textSize = 18f
-    et.setPadding(dp(14), dp(10), dp(14), dp(10))
-    et.inputType = InputType.TYPE_CLASS_TEXT
-    et.imeOptions = EditorInfo.IME_ACTION_SEND
-    et.setSingleLine(true)
-    et.filters = arrayOf(InputFilter.LengthFilter(140))
-    val ebg = GradientDrawable()
-    ebg.cornerRadius = dp(14).toFloat()
-    ebg.setColor(0xEE101F4D.toInt())
-    ebg.setStroke(dp(2), 0xFF4F8CFF.toInt())
-    et.background = ebg
-    et.setOnEditorActionListener { v, actionId, _ ->
-      if (actionId == EditorInfo.IME_ACTION_SEND || actionId == EditorInfo.IME_ACTION_DONE) {
-        val t = v.text.toString().trim()
-        val fx = editorFx
-        val fy = editorFy
-        closeInput()
-        if (t.isNotEmpty()) sendMessage(fx, fy, t)
-        true
-      } else {
-        false
-      }
-    }
-    layer.addView(et, lp)
-    editor = et
-    et.requestFocus()
-    et.postDelayed({
-      try {
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.showSoftInput(et, 0)
-      } catch (e: Exception) {
-      }
-    }, 150)
-  }
-
   private fun closeInput() {
     val layer = inputLayer ?: return
-    try {
-      val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-      imm.hideSoftInputFromWindow(layer.windowToken, 0)
-    } catch (e: Exception) {
-    }
+    penDown = false
+    flushNow()
     try {
       wm.removeView(layer)
     } catch (e: Exception) {
     }
     inputLayer = null
-    editor = null
   }
 
-  private fun showText(fx: Float, fy: Float, text: String, mine: Boolean) {
-    val layer = displayLayer ?: return
-    val tv = TextView(this)
-    tv.text = text
-    tv.setTextColor(Color.WHITE)
-    tv.textSize = 18f
-    tv.maxWidth = dp(260)
-    tv.setPadding(dp(12), dp(8), dp(12), dp(8))
-    val bg = GradientDrawable()
-    bg.cornerRadius = dp(14).toFloat()
-    bg.setColor(if (mine) 0xF04F8CFF.toInt() else 0xF0FF6FAE.toInt())
-    tv.background = bg
-    tv.visibility = View.INVISIBLE
-    layer.addView(
-      tv,
-      FrameLayout.LayoutParams(
-        FrameLayout.LayoutParams.WRAP_CONTENT,
-        FrameLayout.LayoutParams.WRAP_CONTENT
-      )
-    )
-    tv.post {
-      val maxX = (layer.width - tv.width).coerceAtLeast(0).toFloat()
-      val maxY = (layer.height - tv.height).coerceAtLeast(0).toFloat()
-      tv.x = (fx * layer.width).coerceIn(0f, maxX)
-      tv.y = (fy * layer.height).coerceIn(0f, maxY)
-      tv.visibility = View.VISIBLE
+  private fun handleTouch(v: View, ev: MotionEvent) {
+    val w = v.width.coerceAtLeast(1).toFloat()
+    val h = v.height.coerceAtLeast(1).toFloat()
+    val fx = (ev.x / w).coerceIn(0f, 1f)
+    val fy = (ev.y / h).coerceIn(0f, 1f)
+    when (ev.actionMasked) {
+      MotionEvent.ACTION_DOWN -> {
+        penDown = true
+        carryX = -1f
+        carryY = -1f
+        lastFx = fx
+        lastFy = fy
+        pending.clear()
+        pending.add(fx)
+        pending.add(fy)
+        drawView?.addSeg(fx, fy, fx, fy, MINE)
+        scheduleFlush()
+      }
+      MotionEvent.ACTION_MOVE -> {
+        drawView?.addSeg(lastFx, lastFy, fx, fy, MINE)
+        lastFx = fx
+        lastFy = fy
+        pending.add(fx)
+        pending.add(fy)
+      }
+      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+        penDown = false
+        flushNow()
+      }
     }
-    main.postDelayed({ layer.removeView(tv) }, SHOW_MS)
+  }
+
+  private fun scheduleFlush() {
+    main.postDelayed({
+      flushNow()
+      if (penDown) scheduleFlush()
+    }, FLUSH_MS)
+  }
+
+  private fun flushNow() {
+    if (pending.size < 2) return
+    val sb = StringBuilder()
+    if (carryX >= 0f) {
+      sb.append(fmt(carryX)).append(',').append(fmt(carryY)).append(';')
+    }
+    var i = 0
+    while (i + 1 < pending.size) {
+      if (i > 0) sb.append(';')
+      sb.append(fmt(pending[i])).append(',').append(fmt(pending[i + 1]))
+      i += 2
+    }
+    carryX = pending[pending.size - 2]
+    carryY = pending[pending.size - 1]
+    pending.clear()
+    sendChunk(sb.toString())
   }
 
   private fun http(method: String, url: String, body: String?): String {
@@ -418,48 +441,80 @@ class OverlayService : Service() {
       val code = c.responseCode
       val stream = if (code in 200..299) c.inputStream else c.errorStream
       val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-      if (code !in 200..299) throw RuntimeException("HTTP " + code)
+      if (code !in 200..299) throw RuntimeException("HTTP " + code + " " + text.take(120))
       return text
     } finally {
       c.disconnect()
     }
   }
 
-  private fun sendMessage(fx: Float, fy: Float, text: String) {
-    showText(fx, fy, text, true)
+  private fun sendChunk(p: String) {
     val base = dbUrl + "/rooms/" + room + "/msgs"
-    Thread {
+    io.execute {
       try {
-        val body = JSONObject()
-          .put("from", me)
-          .put("x", fx.toDouble())
-          .put("y", fy.toDouble())
-          .put("t", text)
-          .put("ts", JSONObject().put(".sv", "timestamp"))
+        val body = JSONObject().put("from", me).put("p", p)
         val resp = http("POST", base + ".json", body.toString())
         val key = JSONObject(resp).optString("name")
         if (key.isNotEmpty()) {
-          // Keep the database tidy: remove the message after a minute.
-          main.postDelayed({
-            Thread {
-              try {
-                http("DELETE", base + "/" + key + ".json", null)
-              } catch (e: Exception) {
-              }
-            }.start()
-          }, CLEANUP_MS)
+          // Keep the database tidy: remove the chunk after a short while.
+          main.post {
+            if (alive) {
+              main.postDelayed({
+                io.execute {
+                  try {
+                    http("DELETE", base + "/" + key + ".json", null)
+                  } catch (e: Exception) {
+                  }
+                }
+              }, CLEANUP_MS)
+            }
+          }
         }
       } catch (e: Exception) {
+        lastError = "send: " + (e.message ?: e.javaClass.simpleName)
       }
-    }.start()
+    }
+  }
+
+  private fun handleRemote(m: JSONObject) {
+    val p = m.optString("p")
+    if (p.isEmpty()) return
+    val pts = ArrayList<Float>()
+    for (s in p.split(';')) {
+      val xy = s.split(',')
+      if (xy.size != 2) continue
+      val x = xy[0].toFloatOrNull() ?: continue
+      val y = xy[1].toFloatOrNull() ?: continue
+      pts.add(x.coerceIn(0f, 1f))
+      pts.add(y.coerceIn(0f, 1f))
+    }
+    if (pts.size < 2) return
+    main.post {
+      if (!alive) return@post
+      val v = drawView ?: return@post
+      if (pts.size == 2) v.addSeg(pts[0], pts[1], pts[0], pts[1], OTHER)
+      var i = 2
+      while (i + 1 < pts.size) {
+        v.addSeg(pts[i - 2], pts[i - 1], pts[i], pts[i + 1], OTHER)
+        i += 2
+      }
+    }
   }
 
   private fun startPolling() {
-    val url = dbUrl + "/rooms/" + room + "/msgs.json?orderBy=%22%24key%22&limitToLast=30"
+    val base = dbUrl + "/rooms/" + room + "/msgs.json?orderBy=%22%24key%22"
     val t = Thread {
-      var first = true
+      var baselined = false
+      var lastKey = ""
       while (alive) {
         try {
+          val url = if (!baselined) {
+            base + "&limitToLast=1"
+          } else if (lastKey.isEmpty()) {
+            base + "&limitToLast=50"
+          } else {
+            base + "&startAt=%22" + lastKey + "%22"
+          }
           val raw = http("GET", url, null)
           if (raw.isNotEmpty() && raw != "null") {
             val obj = JSONObject(raw)
@@ -467,25 +522,28 @@ class OverlayService : Service() {
             val iter = obj.keys()
             while (iter.hasNext()) keys.add(iter.next())
             keys.sort()
-            for (k in keys) {
-              if (!seen.add(k)) continue
-              if (first) continue
-              val m = obj.optJSONObject(k) ?: continue
-              if (m.optString("from") == me) continue
-              val fx = m.optDouble("x", 0.0).toFloat()
-              val fy = m.optDouble("y", 0.0).toFloat()
-              val text = m.optString("t")
-              if (text.isNotEmpty()) {
-                main.post { if (alive) showText(fx, fy, text, false) }
+            if (!baselined) {
+              if (keys.isNotEmpty()) {
+                lastKey = keys[keys.size - 1]
+                seen.add(lastKey)
+              }
+            } else {
+              for (k in keys) {
+                if (!seen.add(k)) continue
+                if (k > lastKey) lastKey = k
+                val m = obj.optJSONObject(k) ?: continue
+                if (m.optString("from") == me) continue
+                handleRemote(m)
               }
             }
           }
-          first = false
+          baselined = true
+          lastError = ""
         } catch (e: Exception) {
-          // Network problem: try again on the next round.
+          lastError = "poll: " + (e.message ?: e.javaClass.simpleName)
         }
         try {
-          Thread.sleep(1200)
+          Thread.sleep(POLL_MS)
         } catch (e: InterruptedException) {
           break
         }
@@ -501,16 +559,17 @@ class OverlayService : Service() {
     running = false
     poller?.interrupt()
     main.removeCallbacksAndMessages(null)
+    io.shutdown()
     closeInput()
     try {
-      displayLayer?.let { wm.removeView(it) }
+      drawView?.let { wm.removeView(it) }
     } catch (e: Exception) {
     }
     try {
       button?.let { wm.removeView(it) }
     } catch (e: Exception) {
     }
-    displayLayer = null
+    drawView = null
     button = null
     stopForeground(STOP_FOREGROUND_REMOVE)
     super.onDestroy()

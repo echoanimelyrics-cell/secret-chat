@@ -29,12 +29,14 @@ export default function App() {
   const [room, setRoom] = useState('');
   const [overlayOk, setOverlayOk] = useState(false);
   const [running, setRunning] = useState(false);
+  const [err, setErr] = useState('');
   const [msg, setMsg] = useState('');
 
   const refresh = useCallback(() => {
     try {
       setOverlayOk(!!OverlayChat.canDrawOverlays());
       setRunning(!!OverlayChat.isRunning());
+      setErr(String(OverlayChat.lastError() || ''));
     } catch (e) {
       setMsg('Native module load nahi hua: ' + String(e && e.message));
     }
@@ -88,7 +90,7 @@ export default function App() {
     await askNotif();
     try {
       OverlayChat.start(DB_URL, code);
-      setMsg('Sharing ON. Ab kisi bhi app par jao, kinare par Aa button dikhega.');
+      setMsg('Sharing ON. Kisi bhi app par jao, kinare par Draw button dikhega. Use dabao aur ungli se likho.');
     } catch (e) {
       setMsg('Start nahi hua: ' + String(e && e.message));
     }
@@ -143,9 +145,11 @@ export default function App() {
       )}
 
       <Text style={styles.status}>{running ? 'Sharing ON' : 'Sharing OFF'}</Text>
+      {running && !err ? <Text style={styles.ok}>Connection OK</Text> : null}
+      {err ? <Text style={styles.msg}>Problem: {err}</Text> : null}
       {msg ? <Text style={styles.msg}>{msg}</Text> : null}
 
-      <Text style={styles.foot}>Version 1.1.0 (text chat overlay)</Text>
+      <Text style={styles.foot}>Version 1.2.0 (finger draw)</Text>
     </ScrollView>
   );
 }
@@ -204,6 +208,7 @@ const styles = StyleSheet.create({
   },
   btnText: { color: '#FFFFFF', fontSize: 17, fontWeight: '700' },
   status: { color: '#9FB0E0', marginTop: 18, fontSize: 15, fontWeight: '700' },
+  ok: { color: '#4ADE80', marginTop: 8, fontSize: 14 },
   msg: { color: '#FF6FAE', marginTop: 12, textAlign: 'center', fontSize: 14 },
   foot: { color: '#51639C', fontSize: 12, marginTop: 36 },
 });
